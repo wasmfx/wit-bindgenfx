@@ -206,7 +206,10 @@ unsafe fn _resource_new(val: *mut u8) -> u32
     where Self: Sized
 {{
     #[cfg(not(target_arch = "wasm32"))]
-    unreachable!();
+    {{
+        let _ = val;
+        unreachable!();
+    }}
 
     #[cfg(target_arch = "wasm32")]
     {{
@@ -224,7 +227,10 @@ fn _resource_rep(handle: u32) -> *mut u8
     where Self: Sized
 {{
     #[cfg(not(target_arch = "wasm32"))]
-    unreachable!();
+    {{
+        let _ = handle;
+        unreachable!();
+    }}
 
     #[cfg(target_arch = "wasm32")]
     {{
@@ -419,7 +425,7 @@ macro_rules! {macro_name} {{
         let path_to_root = self.path_to_root();
         let module = format!(
             "\
-                #[allow(clippy::all)]
+                #[allow(dead_code, clippy::all)]
                 pub mod {snake} {{
                     #[used]
                     #[doc(hidden)]
@@ -519,25 +525,19 @@ macro_rules! {macro_name} {{
         let params = self.print_export_sig(func);
         self.push_str(" {");
 
-        if self.gen.opts.run_ctors_once_workaround {
+        if !self.gen.opts.disable_run_ctors_once_workaround {
             let run_ctors_once = self.path_to_run_ctors_once();
+            // Before executing any other code, use this function to run all
+            // static constructors, if they have not yet been run. This is a
+            // hack required to work around wasi-libc ctors calling import
+            // functions to initialize the environment.
+            //
+            // See
+            // https://github.com/bytecodealliance/preview2-prototyping/issues/99
+            // for more details.
             uwrite!(
                 self.src,
-                "\
-                // Before executing any other code, use this function to run all static
-                // constructors, if they have not yet been run. This is a hack required
-                // to work around wasi-libc ctors calling import functions to initialize
-                // the environment.
-                //
-                // This functionality will be removed once rust 1.69.0 is stable, at which
-                // point wasi-libc will no longer have this behavior.
-                //
-                // See
-                // https://github.com/bytecodealliance/preview2-prototyping/issues/99
-                // for more details.
-                #[cfg(target_arch=\"wasm32\")]
-                {run_ctors_once}();
-",
+                "#[cfg(target_arch=\"wasm32\")]\n{run_ctors_once}();",
             );
         }
 
@@ -1917,7 +1917,7 @@ macro_rules! {macro_name} {{
     }
 
     fn path_to_run_ctors_once(&mut self) -> String {
-        self.path_from_runtime_module(RuntimeItem::RunCtorsOnce, "bool_lift")
+        self.path_from_runtime_module(RuntimeItem::RunCtorsOnce, "run_ctors_once")
     }
 
     pub fn path_to_vec(&mut self) -> String {
@@ -2087,7 +2087,7 @@ impl {camel} {{
 
     fn as_ptr<T: Guest{camel}>(&self) -> *mut _{camel}Rep<T> {{
        {camel}::type_guard::<T>();
-       unsafe {{ T::_resource_rep(self.handle()).cast() }}
+       T::_resource_rep(self.handle()).cast()
     }}
 }}
 

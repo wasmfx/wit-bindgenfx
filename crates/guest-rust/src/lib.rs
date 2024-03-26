@@ -782,9 +782,9 @@
 ///     // support the standard library itself depending on this crate one day.
 ///     std_feature,
 ///
-///     // Force a workaround to be emitted for pre-Rust-1.69.0 modules to
-///     // ensure that libc ctors run only once.
-///     run_ctors_once_workaround: true,
+///     // Disable a workaround to force wasm constructors to be run only once
+///     // when exported functions are called.
+///     disable_run_ctors_once_workaround: false,
 /// });
 /// ```
 ///
@@ -792,9 +792,10 @@
 #[cfg(feature = "macros")]
 pub use wit_bindgen_rust_macro::generate;
 
-// Re-export `bitflags` so that we can reference it from macros.
+// This re-export is no longer needed in new bindings and is only
+// here for compatibility.
 #[doc(hidden)]
-pub use bitflags;
+pub use rt::bitflags;
 
 mod pre_wit_bindgen_0_20_0;
 
@@ -803,12 +804,18 @@ pub mod examples;
 
 #[doc(hidden)]
 pub mod rt {
+    // Re-export `bitflags` so that we can reference it from macros.
+    pub use wit_bindgen_rt::bitflags;
+
+    #[cfg(target_arch = "wasm32")]
+    pub use wit_bindgen_rt::run_ctors_once;
+
     pub fn maybe_link_cabi_realloc() {
         #[cfg(feature = "realloc")]
         wit_bindgen_rt::maybe_link_cabi_realloc();
     }
 
-    #[cfg(feature = "realloc")]
+    #[cfg(all(feature = "realloc", not(target_env = "p2")))]
     pub use wit_bindgen_rt::cabi_realloc;
 
     pub use crate::pre_wit_bindgen_0_20_0::*;
