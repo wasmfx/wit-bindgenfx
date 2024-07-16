@@ -32,11 +32,11 @@ indexmap = "2.0.0"
 prettyplease = "0.2.20"
 syn = { version = "2.0", features = ["printing"] }
 
-wasmparser    = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.212.0" }
-wasm-metadata = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.212.0" }
-wasm-encoder  = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.212.0" }
-wit-parser    = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.212.0" }
-wit-component = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.212.0" }
+wasmparser    = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.213.0" }
+wasm-metadata = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.213.0" }
+wasm-encoder  = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.213.0" }
+wit-parser    = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.213.0" }
+wit-component = { git = "https://github.com/wasmfx/wasmfx-tools", tag = "v1.213.0" }
 
 wit-bindgen-core = { path = 'crates/core', version = '0.27.0' }
 wit-bindgen-c = { path = 'crates/c', version = '0.27.0' }
