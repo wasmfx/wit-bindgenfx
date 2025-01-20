@@ -1,4 +1,4 @@
-use crate::{int_repr, to_rust_ident, wasm_type, InterfaceGenerator, RustFlagsRepr};
+use crate::{int_repr, to_rust_ident, wasm_type, Identifier, InterfaceGenerator, RustFlagsRepr};
 use heck::*;
 use std::fmt::Write as _;
 use std::mem;
@@ -8,6 +8,8 @@ use wit_bindgen_core::{dealias, uwrite, uwriteln, wit_parser::*, Source};
 pub(super) struct FunctionBindgen<'a, 'b> {
     pub gen: &'b mut InterfaceGenerator<'a>,
     params: Vec<String>,
+    async_: bool,
+    wasm_import_module: &'b str,
     pub src: Source,
     blocks: Vec<String>,
     block_storage: Vec<(Source, Vec<(String, String)>)>,
@@ -17,16 +19,24 @@ pub(super) struct FunctionBindgen<'a, 'b> {
     pub import_return_pointer_area_size: usize,
     pub import_return_pointer_area_align: usize,
     pub handle_decls: Vec<String>,
+    always_owned: bool,
+    pub async_result_name: Option<String>,
+    emitted_cleanup: bool,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
     pub(super) fn new(
         gen: &'b mut InterfaceGenerator<'a>,
         params: Vec<String>,
+        async_: bool,
+        wasm_import_module: &'b str,
+        always_owned: bool,
     ) -> FunctionBindgen<'a, 'b> {
         FunctionBindgen {
             gen,
             params,
+            async_,
+            wasm_import_module,
             src: Default::default(),
             blocks: Vec::new(),
             block_storage: Vec::new(),
@@ -36,10 +46,17 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             import_return_pointer_area_size: 0,
             import_return_pointer_area_align: 0,
             handle_decls: Vec::new(),
+            always_owned,
+            async_result_name: None,
+            emitted_cleanup: false,
         }
     }
 
     fn emit_cleanup(&mut self) {
+        if self.emitted_cleanup {
+            return;
+        }
+        self.emitted_cleanup = true;
         for (ptr, layout) in mem::take(&mut self.cleanup) {
             let alloc = self.gen.path_to_std_alloc_module();
             self.push_str(&format!(
@@ -58,14 +75,9 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
         }
     }
 
-    fn declare_import(
-        &mut self,
-        module_name: &str,
-        name: &str,
-        params: &[WasmType],
-        results: &[WasmType],
-    ) -> String {
+    fn declare_import(&mut self, name: &str, params: &[WasmType], results: &[WasmType]) -> String {
         // Define the actual function we're calling inline
+        let tmp = self.tmp();
         let mut sig = "(".to_owned();
         for param in params.iter() {
             sig.push_str("_: ");
@@ -78,6 +90,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             sig.push_str(" -> ");
             sig.push_str(wasm_type(*result));
         }
+        let module_name = self.wasm_import_module;
         uwrite!(
             self.src,
             "
@@ -85,14 +98,14 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
                 #[link(wasm_import_module = \"{module_name}\")]
                 extern \"C\" {{
                     #[link_name = \"{name}\"]
-                    fn wit_import{sig};
+                    fn wit_import{tmp}{sig};
                 }}
 
                 #[cfg(not(target_arch = \"wasm32\"))]
-                fn wit_import{sig} {{ unreachable!() }}
+                extern \"C\" fn wit_import{tmp}{sig} {{ unreachable!() }}
             "
         );
-        "wit_import".to_string()
+        format!("wit_import{tmp}")
     }
 
     fn let_results(&mut self, amt: usize, results: &mut Vec<String>) {
@@ -188,10 +201,11 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
     }
 
     fn typename_lower(&self, id: TypeId) -> String {
-        let owned = match self.lift_lower() {
-            LiftLower::LowerArgsLiftResults => false,
-            LiftLower::LiftArgsLowerResults => true,
-        };
+        let owned = self.always_owned
+            || match self.lift_lower() {
+                LiftLower::LowerArgsLiftResults => false,
+                LiftLower::LiftArgsLowerResults => true,
+            };
         self.gen.type_path(id, owned)
     }
 
@@ -292,7 +306,12 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             return false;
         }
         match ty {
-            Type::Id(id) => !self.gen.gen.types.get(*id).has_resource,
+            // Note that tuples in Rust are not ABI-compatible with component
+            // model tuples, so those are exempted here from canonical lists.
+            Type::Id(id) => {
+                let info = self.gen.gen.types.get(*id);
+                !info.has_resource && !info.has_tuple
+            }
             _ => true,
         }
     }
@@ -454,6 +473,61 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     )
                 };
                 results.push(result);
+            }
+
+            Instruction::FutureLower { .. } => {
+                let op = &operands[0];
+                results.push(format!("({op}).take_handle() as i32"))
+            }
+
+            Instruction::FutureLift { payload, .. } => {
+                let async_support = self.gen.path_to_async_support();
+                let op = &operands[0];
+                let name = payload
+                    .as_ref()
+                    .map(|ty| {
+                        self.gen
+                            .type_name_owned_with_id(ty, Identifier::StreamOrFuturePayload)
+                    })
+                    .unwrap_or_else(|| "()".into());
+                let ordinal = self.gen.gen.future_payloads.get_index_of(&name).unwrap();
+                let path = self.gen.path_to_root();
+                results.push(format!(
+                    "{async_support}::FutureReader::from_handle_and_vtable\
+                     ({op} as u32, &{path}wit_future::vtable{ordinal}::VTABLE)"
+                ))
+            }
+
+            Instruction::StreamLower { .. } => {
+                let op = &operands[0];
+                results.push(format!("({op}).take_handle() as i32"))
+            }
+
+            Instruction::StreamLift { payload, .. } => {
+                let async_support = self.gen.path_to_async_support();
+                let op = &operands[0];
+                let name = self
+                    .gen
+                    .type_name_owned_with_id(payload, Identifier::StreamOrFuturePayload);
+                let ordinal = self.gen.gen.stream_payloads.get_index_of(&name).unwrap();
+                let path = self.gen.path_to_root();
+                results.push(format!(
+                    "{async_support}::StreamReader::from_handle_and_vtable\
+                     ({op} as u32, &{path}wit_stream::vtable{ordinal}::VTABLE)"
+                ))
+            }
+
+            Instruction::ErrorContextLower { .. } => {
+                let op = &operands[0];
+                results.push(format!("({op}).handle() as i32"))
+            }
+
+            Instruction::ErrorContextLift { .. } => {
+                let async_support = self.gen.path_to_async_support();
+                let op = &operands[0];
+                results.push(format!(
+                    "{async_support}::ErrorContext::from_handle({op} as u32)"
+                ))
             }
 
             Instruction::RecordLower { ty, record, .. } => {
@@ -779,12 +853,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::IterBasePointer => results.push("base".to_string()),
 
             Instruction::CallWasm { name, sig, .. } => {
-                let func = self.declare_import(
-                    self.gen.wasm_import_module.unwrap(),
-                    name,
-                    &sig.params,
-                    &sig.results,
-                );
+                let func = self.declare_import(name, &sig.params, &sig.results);
 
                 // ... then call the function with all our operands
                 if !sig.results.is_empty() {
@@ -797,26 +866,55 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 self.push_str(");\n");
             }
 
+            Instruction::AsyncCallWasm { name, size, align } => {
+                let func = self.declare_import(name, &[WasmType::Pointer; 2], &[WasmType::I32]);
+
+                let async_support = self.gen.path_to_async_support();
+                let tmp = self.tmp();
+                let layout = format!("layout{tmp}");
+                let alloc = self.gen.path_to_std_alloc_module();
+                self.push_str(&format!(
+                    "let {layout} = {alloc}::Layout::from_size_align_unchecked({size}, {align});\n",
+                ));
+                let operands = operands.join(", ");
+                uwriteln!(
+                    self.src,
+                    "{async_support}::await_result({func}, {layout}, {operands}).await;"
+                );
+            }
+
             Instruction::CallInterface { func, .. } => {
-                self.let_results(func.results.len(), results);
-                match &func.kind {
+                if self.async_ {
+                    self.push_str(&format!("let result = "));
+                    results.push("result".into());
+                } else {
+                    self.let_results(func.results.len(), results);
+                };
+                let constructor_type = match &func.kind {
                     FunctionKind::Freestanding => {
                         self.push_str(&format!("T::{}", to_rust_ident(&func.name)));
+                        None
                     }
                     FunctionKind::Method(_) | FunctionKind::Static(_) => {
                         self.push_str(&format!("T::{}", to_rust_ident(func.item_name())));
+                        None
                     }
                     FunctionKind::Constructor(ty) => {
-                        self.push_str(&format!(
-                            "{}::new(T::new",
-                            resolve.types[*ty]
-                                .name
-                                .as_deref()
-                                .unwrap()
-                                .to_upper_camel_case()
-                        ));
+                        let ty = resolve.types[*ty]
+                            .name
+                            .as_deref()
+                            .unwrap()
+                            .to_upper_camel_case();
+                        let call = if self.async_ {
+                            let async_support = self.gen.path_to_async_support();
+                            format!("{async_support}::futures::FutureExt::map(T::new")
+                        } else {
+                            format!("{ty}::new(T::new",)
+                        };
+                        self.push_str(&call);
+                        Some(ty)
                     }
-                }
+                };
                 self.push_str("(");
                 for (i, operand) in operands.iter().enumerate() {
                     if i > 0 {
@@ -833,10 +931,96 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     }
                 }
                 self.push_str(")");
-                if let FunctionKind::Constructor(_) = &func.kind {
-                    self.push_str(")");
+                if let Some(ty) = constructor_type {
+                    self.push_str(&if self.async_ {
+                        format!(", {ty}::new)")
+                    } else {
+                        ")".into()
+                    });
+                }
+                if self.async_ {
+                    self.push_str(".await");
                 }
                 self.push_str(";\n");
+            }
+
+            Instruction::AsyncMalloc { size, align } => {
+                let alloc = self.gen.path_to_std_alloc_module();
+                let tmp = self.tmp();
+                let ptr = format!("ptr{tmp}");
+                let layout = format!("layout{tmp}");
+                uwriteln!(
+                    self.src,
+                    "let {layout} = {alloc}::Layout::from_size_align_unchecked({size}, {align});
+                     let {ptr} = {alloc}::alloc({layout});"
+                );
+                results.push(ptr);
+            }
+
+            Instruction::AsyncPostCallInterface { func } => {
+                let result = &operands[0];
+                self.async_result_name = Some(result.clone());
+                results.push("result".into());
+                let params = (0..func.results.len())
+                    .map(|_| {
+                        let tmp = self.tmp();
+                        let param = format!("result{}", tmp);
+                        results.push(param.clone());
+                        param
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let params = if func.results.len() != 1 {
+                    format!("({params})")
+                } else {
+                    params
+                };
+                let async_support = self.gen.path_to_async_support();
+                // TODO: This relies on `abi::Generator` emitting
+                // `AsyncCallReturn` immediately after this instruction to
+                // complete the incomplete expression we generate here.  We
+                // should refactor this so it's less fragile (e.g. have
+                // `abi::Generator` emit a `AsyncCallReturn` first, which would
+                // push a closure expression we can consume here).
+                //
+                // Also, see `InterfaceGenerator::generate_guest_export` for
+                // where we emit the open bracket corresponding to the `};` we
+                // emit here.
+                //
+                // The async-specific `Instruction`s will probably need to be
+                // refactored anyway once we start implementing support for
+                // other languages besides Rust.
+                uwriteln!(
+                    self.src,
+                    "\
+                            {result}
+                        }};
+                        let result = {async_support}::first_poll({result}, |{params}| {{
+                    "
+                );
+            }
+
+            Instruction::AsyncCallReturn { name, params } => {
+                let func = self.declare_import(name, params, &[]);
+
+                uwriteln!(
+                    self.src,
+                    "\
+                            {func}({});
+                    ",
+                    operands.join(", ")
+                );
+                self.emit_cleanup();
+                self.src.push_str("});\n");
+            }
+
+            Instruction::Flush { amt } => {
+                for i in 0..*amt {
+                    let tmp = self.tmp();
+                    let result = format!("result{}", tmp);
+                    uwriteln!(self.src, "let {result} = {};", operands[i]);
+                    results.push(result);
+                }
             }
 
             Instruction::Return { amt, .. } => {
@@ -868,7 +1052,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 let tmp = self.tmp();
                 uwriteln!(
                     self.src,
-                    "let l{tmp} = i32::from(*{}.add({offset}).cast::<u8>());",
+                    "let l{tmp} = i32::from(*{0}.add({offset}).cast::<u8>());",
                     operands[0]
                 );
                 results.push(format!("l{tmp}"));
